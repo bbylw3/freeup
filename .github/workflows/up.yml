@@ -1,0 +1,120 @@
+name: Auto Update Worker
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 */3 * * *" # 修改为每3小时运行一次，以匹配上游更新频率
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '是否强制更新 (忽略内容哈希检查)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write # 允许工作流写入仓库内容
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      REPO_OWNER: "bia-pain-bache"
+      REPO_NAME: "BPB-Worker-Panel"
+      TARGET_FILE: "worker.zip"
+    outputs:
+      updated: ${{ steps.check_update_step.outputs.updated }}
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 检查并更新 Worker (基于文件哈希)
+        id: check_update_step
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail # 任何命令失败则立即退出
+
+          # 日志函数，方便调试
+          log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
+
+          log "开始基于文件哈希检查更新..."
+          echo "updated=false" >> $GITHUB_OUTPUT # 默认未更新
+
+          # --- 1. 获取最新 Release 的信息 ---
+          LATEST_RELEASE_URL="https://api.github.com/repos/${{ env.REPO_OWNER }}/${{ env.REPO_NAME }}/releases/latest"
+          log "获取最新 Release 信息 از: $LATEST_RELEASE_URL"
+
+          RESPONSE=$(curl -s --retry 3 -L \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "$LATEST_RELEASE_URL")
+
+          # 检查 API 响应是否有效
+          if echo "$RESPONSE" | jq -e '.message' > /dev/null; then
+            log "ERROR: GitHub API 返回错误: $(echo "$RESPONSE" | jq -r '.message')"
+            exit 1
+          fi
+
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.assets[] | select(.name == "'"$TARGET_FILE"'") | .browser_download_url')
+          REMOTE_TAG=$(echo "$RESPONSE" | jq -r '.tag_name') # 仍然获取版本号，用于日志和提交信息
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+            log "ERROR: 在最新 Release ($REMOTE_TAG) 中未找到目标文件 '$TARGET_FILE'"
+            exit 1
+          fi
+
+          # --- 2. 比较文件哈希值 ---
+          # 计算本地文件哈希 (如果存在)
+          LOCAL_HASH=""
+          if [ -f "${{ env.TARGET_FILE }}" ]; then
+            LOCAL_HASH=$(sha256sum "${{ env.TARGET_FILE }}" | awk '{print $1}')
+            log "本地文件哈希: $LOCAL_HASH"
+          else
+            log "本地文件 '${{ env.TARGET_FILE }}' 不存在，将直接下载。"
+          fi
+
+          # 下载远程文件到临时位置并计算哈希
+          log "下载远程文件用于哈希比较..."
+          REMOTE_TEMP_FILE=$(mktemp) # 创建一个临时文件
+          wget --quiet -O "$REMOTE_TEMP_FILE" "$DOWNLOAD_URL"
+          REMOTE_HASH=$(sha256sum "$REMOTE_TEMP_FILE" | awk '{print $1}')
+          log "远程文件哈希: $REMOTE_HASH"
+
+          # --- 3. 判断是否需要更新 ---
+          FORCE_UPDATE="${{ github.event.inputs.force_update || 'false' }}"
+          log "强制更新: $FORCE_UPDATE"
+
+          if [ "$LOCAL_HASH" = "$REMOTE_HASH" ] && [ "$FORCE_UPDATE" != "true" ]; then
+            log "文件内容未发生变化 (哈希值相同)，无需更新。"
+            rm "$REMOTE_TEMP_FILE" # 清理临时文件
+            exit 0
+          fi
+
+          # --- 4. 执行更新 ---
+          if [ "$FORCE_UPDATE" = "true" ]; then
+            log "强制更新已触发。"
+          else
+            log "检测到文件内容更新 (哈希值不同)。"
+          fi
+
+          log "正在用新文件替换旧文件..."
+          mv "$REMOTE_TEMP_FILE" "${{ env.TARGET_FILE }}"
+
+          log "解压 ${{ env.TARGET_FILE }}..."
+          unzip -o "${{ env.TARGET_FILE }}" # -o 覆盖已存在文件，不询问
+
+          log "更新完成！"
+          echo "updated=true" >> $GITHUB_OUTPUT
+
+      - name: 提交更改
+        if: steps.check_update_step.outputs.updated == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          # 提交信息可以包含上游版本和本次更新的 commit SHA，便于追踪
+          commit_message: "🔄 自动同步 Worker 内容 (上游版本: ${{ steps.check_update_step.outputs.remote_tag || 'N/A' }})"
+          commit_author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          # 确保 worker.zip 和所有解压出的文件都被提交
+          file_pattern: .
